@@ -29,7 +29,14 @@ g++ -std=c++11 -Wall -Wextra -pedantic linux/ex1.cpp -o ex1
 
 `ex1.cpp`, `ex2.cpp`, and `ex3.cpp` illustrate the basic API, non-blocking
 interaction with child output, and redirecting the child's output to a file
-descriptor.
+descriptor. `linux_asio_coroutines.cpp` shows how to integrate two child
+processes with [Asio standalone](https://think-async.com/) and C++20 coroutines
+so their stdout streams are consumed concurrently:
+
+```bash
+g++ -std=c++20 -Wall -Wextra -pedantic -pthread \
+    -I../include linux_asio_coroutines.cpp -o linux_asio_coroutines
+```
 
 ### Windows
 
@@ -40,6 +47,14 @@ cl /EHsc /std:c++17 windows\ex1.cpp
 The Windows examples mirror the POSIX ones and demonstrate how to integrate the
 class with Windows HANDLEs, overlapped I/O, and file redirection. Adjust the
 compiler options to match your toolchain (MSVC, MinGW, etc.).
+
+`windows_asio_coroutines.cpp` complements the Linux coroutine sample with a
+version that uses `asio::windows::stream_handle` and overlapped pipes. Build it
+with a C++20-capable MSVC or MinGW configuration, for example:
+
+```powershell
+cl /EHsc /std:c++20 /I ..\include windows_asio_coroutines.cpp
+```
 
 ## Usage highlights
 
