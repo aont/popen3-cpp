@@ -1,11 +1,5 @@
-#include "popen3.hpp"
-
-#define ASIO_STANDALONE
-#include <asio.hpp>
-#include <asio/co_spawn.hpp>
-#include <asio/redirect_error.hpp>
-#include <asio/use_awaitable.hpp>
-#include <asio/windows/stream_handle.hpp>
+// ensure <winsock2.h> is included before <windows.h>
+#include <winsock2.h>
 
 #include <array>
 #include <iostream>
@@ -14,7 +8,13 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <windows.h>
+
+#define ASIO_STANDALONE
+#include <asio.hpp>
+
+
+#include "popen3.hpp"
+
 
 struct coroutine_process : std::enable_shared_from_this<coroutine_process> {
     std::string name;

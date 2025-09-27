@@ -1,8 +1,8 @@
 CXX ?= g++
-CPPFLAGS ?= -I../include
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -pedantic
-LDFLAGS ?=
-WINDOWS_LIBS ?= -lws2_32
+override CPPFLAGS += -I../include
+override CXXFLAGS += -std=c++20 -Wall -Wextra -pedantic
+# LDFLAGS ?=
+override WINDOWS_LIBS += -lws2_32
 
 LINUX_SOURCES := $(wildcard linux_*.cpp)
 WINDOWS_SOURCES := $(wildcard windows_*.cpp)
