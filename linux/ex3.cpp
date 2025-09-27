@@ -10,13 +10,13 @@ int main() {
     int fd = ::open("out.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
     popen3::options opt;
-    opt.out = popen3::stream_spec::use_fd(fd); // 子の stdout を fd に差し替え
-    // （子では dup2 の後、fd をクローズ。親の fd はそのまま）
+    opt.out = popen3::stream_spec::use_fd(fd); // Route the child's stdout to fd
+    // (Child closes the fd after dup2; the parent keeps its descriptor)
 
     popen3 proc;
     std::vector<std::string> argv; argv.push_back("echo"); argv.push_back("hello");
     proc.start(argv, opt);
     proc.wait(0, 0);
-    ::close(fd); // 親の責務でクローズ
+    ::close(fd); // The parent is responsible for closing the fd
     return 0;
 }

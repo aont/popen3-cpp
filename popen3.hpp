@@ -31,7 +31,7 @@ public:
     struct stream_spec {
         enum kind_t { INHERIT, PIPE, USE_HANDLE };
         kind_t kind;
-        HANDLE user_handle; // USE_HANDLE のときのみ
+        HANDLE user_handle; // Only used when kind is USE_HANDLE
         stream_spec() : kind(INHERIT), user_handle(NULL) {}
         static stream_spec inherit() { stream_spec s; s.kind = INHERIT; return s; }
         static stream_spec pipe()    { stream_spec s; s.kind = PIPE;    return s; }
@@ -42,9 +42,9 @@ public:
         stream_spec in;   // child's stdin
         stream_spec out;  // child's stdout
         stream_spec err;  // child's stderr
-        bool parent_nonblock; // 同期モード時: データ無しで 0 を返す（PeekNamedPipe）
-        bool overlapped_io;   // true なら PIPE は NamedPipe + Overlapped で構築
-        size_t io_buffer_size;// Overlapped 読み取りチャンクサイズ
+        bool parent_nonblock; // In synchronous mode, return 0 when no data is available (PeekNamedPipe)
+        bool overlapped_io;   // When true, build pipes as NamedPipe with overlapped I/O
+        size_t io_buffer_size;// Chunk size for overlapped reads
         options() : in(stream_spec::inherit()),
                     out(stream_spec::inherit()),
                     err(stream_spec::inherit()),
@@ -66,7 +66,7 @@ public:
     }
 
     ~popen3() {
-        // Overlapped の保留 I/O をキャンセルしてからクローズ
+        // Cancel pending overlapped I/O before closing handles
         cancel_all_io_();
         close_stdin();
         close_stdout();
@@ -78,7 +78,7 @@ public:
         if (in_wr_.evt)  CloseHandle(in_wr_.evt);
     }
 
-    // argv: UTF-8。argv[0] はコマンド名/パス
+    // argv uses UTF-8; argv[0] should be the command name or path
     bool start(const std::vector<std::string>& argv, const options& opt) {
         clear_error();
         if (argv.empty()) return set_error("argv is empty", ERROR_INVALID_PARAMETER), false;
@@ -94,15 +94,15 @@ public:
         sa_inh.bInheritHandle = TRUE;
         sa_inh.lpSecurityDescriptor = NULL;
 
-        // 子標準ハンドル（継承対象）を用意
-        HANDLE ch_in  = NULL; // 子の stdin  (READ側)
-        HANDLE ch_out = NULL; // 子の stdout (WRITE側)
-        HANDLE ch_err = NULL; // 子の stderr (WRITE側)
+        // Prepare inheritable handles for the child's standard streams
+        HANDLE ch_in  = NULL; // Child's stdin (read end)
+        HANDLE ch_out = NULL; // Child's stdout (write end)
+        HANDLE ch_err = NULL; // Child's stderr (write end)
 
-        // 親が使うエンド
-        HANDLE parent_in_w  = NULL; // 親->子
-        HANDLE parent_out_r = NULL; // 子->親
-        HANDLE parent_err_r = NULL; // 子->親
+        // Handles used by the parent
+        HANDLE parent_in_w  = NULL; // Parent -> child
+        HANDLE parent_out_r = NULL; // Child -> parent
+        HANDLE parent_err_r = NULL; // Child -> parent
 
         // ---- stdin ----
         if (opt.in.kind == stream_spec::PIPE) {
@@ -111,7 +111,7 @@ public:
             } else {
                 HANDLE r=NULL, w=NULL;
                 if (!CreatePipe(&r, &w, &sa_inh, 0)) return fail_api("CreatePipe(stdin) (anon)"), false;
-                // 親 write（w）を保持。子は read（r）を継承
+                // Keep the parent write end (w); the child inherits the read end (r)
                 if (!SetHandleInformation(w, HANDLE_FLAG_INHERIT, 0)) { CloseHandle(r); CloseHandle(w); return fail_api("SetHandleInformation(stdin w)"); }
                 parent_in_w = w; ch_in = r;
             }
@@ -172,13 +172,13 @@ public:
             NULL,
             cmd_buf.empty()? NULL : &cmd_buf[0],
             NULL, NULL,
-            TRUE,      // 子へ継承
+            TRUE,      // Inheritable by the child
             0,
             NULL, NULL,
             &si, &pi
         );
 
-        // 親では子ハンドルをすぐ閉じる（継承済み）
+        // Close the child handles in the parent immediately after inheritance
         if (ch_in)  CloseHandle(ch_in);
         if (ch_out) CloseHandle(ch_out);
         if (ch_err) CloseHandle(ch_err);
@@ -194,16 +194,16 @@ public:
         th_   = pi.hThread;
         pid_  = (unsigned long)pi.dwProcessId;
 
-        // 親側エンドを保持
+        // Store the parent ends
         h_stdin_w_  = parent_in_w;
         h_stdout_r_ = parent_out_r;
         h_stderr_r_ = parent_err_r;
 
-        // Overlapped 状態初期化＆最初の Read を投入
+        // Initialize overlapped state and queue the first Read
         if (overlapped_) {
             if (opt.out.kind == stream_spec::PIPE && h_stdout_r_) {
                 setup_ov_read_(out_rd_, h_stdout_r_, io_buf_size_);
-                post_read_(out_rd_); // 最初のリクエスト
+                post_read_(out_rd_); // Submit the initial request
             }
             if (opt.err.kind == stream_spec::PIPE && h_stderr_r_) {
                 setup_ov_read_(err_rd_, h_stderr_r_, io_buf_size_);
@@ -217,8 +217,8 @@ public:
         return true;
     }
 
-    // ---- 親→子 stdin (同期) ----
-    // Overlapped 構成でも同期 WriteFile を許容
+    // ---- Parent -> child stdin (synchronous) ----
+    // Allow synchronous WriteFile even when configured for overlapped I/O
     ssize_t write_stdin(const void* buf, size_t len) {
         if (!h_stdin_w_) return set_error("stdin not available", ERROR_INVALID_HANDLE), (ssize_t)-1;
         DWORD n = 0;
@@ -231,8 +231,8 @@ public:
         return (ssize_t)n;
     }
 
-    // ---- 親→子 stdin (非同期 Overlapped) ----
-    // 同時に 1 件のみ保留可能。完了は stdin_event() で待機し、try_finalize_stdin_write() で取り出す。
+    // ---- Parent -> child stdin (asynchronous overlapped) ----
+    // Only one pending request is allowed; wait on stdin_event() and call try_finalize_stdin_write() to retrieve the result.
     bool write_stdin_async(const void* buf, size_t len) {
         if (!overlapped_ || !h_stdin_w_) return set_error("stdin async not available", ERROR_INVALID_HANDLE), false;
         if (in_wr_.pending) return set_error("stdin write already pending", ERROR_IO_PENDING), false;
@@ -248,7 +248,7 @@ public:
         DWORD n = 0;
         BOOL ok = WriteFile(in_wr_.h, &in_wr_.buf[0], (DWORD)in_wr_.size, &n, &in_wr_.ov);
         if (ok) {
-            // 即時完了
+            // Completed immediately
             in_wr_.pending = false;
             in_wr_.last_n  = n;
             SetEvent(in_wr_.evt);
@@ -264,7 +264,7 @@ public:
 
     bool stdin_write_pending() const { return in_wr_.pending; }
 
-    // 完了していれば true を返し、*nwritten に書き込まれたバイト数を返す
+    // If complete, return true and store the written byte count in *nwritten
     bool try_finalize_stdin_write(size_t* nwritten) {
         if (!overlapped_ || !h_stdin_w_) return false;
         if (!in_wr_.pending) {
@@ -275,7 +275,7 @@ public:
         BOOL ok = GetOverlappedResult(in_wr_.h, &in_wr_.ov, &n, FALSE);
         if (!ok) {
             DWORD e = GetLastError();
-            if (e == ERROR_IO_INCOMPLETE) return false; // まだ
+            if (e == ERROR_IO_INCOMPLETE) return false; // Not finished yet
             if (e == ERROR_BROKEN_PIPE) {
                 in_wr_.pending = false;
                 in_wr_.last_n = 0;
@@ -284,7 +284,7 @@ public:
                 return true;
             }
             fail_api("GetOverlappedResult(stdin)");
-            in_wr_.pending = false; // 以降の操作を可能にする
+            in_wr_.pending = false; // Allow subsequent operations
             in_wr_.last_n = 0;
             if (nwritten) *nwritten = 0;
             return true;
@@ -295,12 +295,12 @@ public:
         return true;
     }
 
-    // ---- 子→親 stdout/stderr 読み取り ----
-    // Overlapped 構成：
-    //   - イベントがシグナル後、read_* を呼ぶと内部バッファから返却し、消費し終わったら次の Read を投入。
-    //   - データが無ければ 0（非エラー）。
-    // 非 Overlapped 構成：
-    //   - parent_nonblock==true なら PeekNamedPipe で 0/データ量ぶん返却。同期 read も可。
+    // ---- Child -> parent stdout/stderr reads ----
+    // Overlapped mode:
+    //   - After the event is signaled, read_* returns data from the internal buffer and queues the next Read when drained.
+    //   - Return 0 when no data is available (not an error).
+    // Non-overlapped mode:
+    //   - If parent_nonblock==true, use PeekNamedPipe to return 0 or the available amount; synchronous reads are also possible.
     ssize_t read_stdout(void* buf, size_t len) {
         if (!h_stdout_r_) return set_error("stdout not available", ERROR_INVALID_HANDLE), (ssize_t)-1;
         if (overlapped_ && out_rd_.evt) return read_from_ov_(out_rd_, buf, len, "stdout");
@@ -312,23 +312,23 @@ public:
         return read_sync_(h_stderr_r_, buf, len, "stderr");
     }
 
-    // ストリームを閉じる
+    // Close streams
     void close_stdin()  { close_and_reset_write_(in_wr_, h_stdin_w_);  }
     void close_stdout() { close_and_reset_read_(out_rd_, h_stdout_r_); }
     void close_stderr() { close_and_reset_read_(err_rd_, h_stderr_r_); }
 
-    // 親が保持するハンドル（便宜）
-    HANDLE stdin_handle()  const { return h_stdin_w_;  } // 親 Write 側
-    HANDLE stdout_handle() const { return h_stdout_r_; } // 親 Read 側
-    HANDLE stderr_handle() const { return h_stderr_r_; } // 親 Read 側
+    // Handles kept by the parent (for convenience)
+    HANDLE stdin_handle()  const { return h_stdin_w_;  } // Parent write side
+    HANDLE stdout_handle() const { return h_stdout_r_; } // Parent read side
+    HANDLE stderr_handle() const { return h_stderr_r_; } // Parent read side
 
-    // ---- WaitForMultipleObjects 用 ----
+    // ---- For WaitForMultipleObjects ----
     HANDLE process_handle() const { return proc_; }
     HANDLE stdout_event()  const { return out_rd_.evt; }
     HANDLE stderr_event()  const { return err_rd_.evt; }
-    HANDLE stdin_event()   const { return in_wr_.evt; } // 非同期書き込み完了
+    HANDLE stdin_event()   const { return in_wr_.evt; } // Asynchronous write completion
 
-    // 便利関数：待機対象を収集（proc + out + err [+stdin write]）
+    // Utility: gather wait handles (proc + out + err [+stdin write])
     void collect_wait_handles(std::vector<HANDLE>& out, bool include_stdin_evt=false) const {
         out.clear();
         if (proc_) out.push_back(proc_);
@@ -337,14 +337,14 @@ public:
         if (include_stdin_evt && in_wr_.evt) out.push_back(in_wr_.evt);
     }
 
-    // プロセス管理
+    // Process management
     bool alive() const {
         if (!proc_) return false;
         DWORD r = WaitForSingleObject(proc_, 0);
         return r == WAIT_TIMEOUT;
     }
 
-    // timeout_ms==0 で無限待ち（従来互換）
+    // timeout_ms==0 means wait forever (legacy behavior)
     bool wait(int* exit_status, unsigned timeout_ms) {
         if (!proc_) return set_error("process not started", ERROR_INVALID_HANDLE), false;
         DWORD tm = (timeout_ms == 0) ? INFINITE : (DWORD)timeout_ms;
@@ -357,13 +357,13 @@ public:
         return true;
     }
 
-    // 情報
+    // Information
     const std::string& last_error() const { return last_msg_; }
     int  last_errno() const { return (int)last_err_; }
     unsigned long pid() const { return pid_; }
 
 private:
-    // -------- 内部状態 --------
+    // -------- Internal state --------
     HANDLE proc_;
     HANDLE th_;
     unsigned long pid_;
@@ -380,25 +380,25 @@ private:
     std::string last_msg_;
 
     struct ov_read_t {
-        HANDLE h;        // 親の Read ハンドル
+        HANDLE h;        // Parent read handle
         OVERLAPPED ov;
-        HANDLE evt;      // 完了イベント
+        HANDLE evt;      // Completion event
         std::vector<char> buf;
-        size_t have;     // buf に格納済み（完了済み）バイト数
-        size_t pos;      // 既に返却済み位置
-        bool pending;    // ReadFile 投入中
-        bool eof;        // EOF 到達（0 バイト完了）
+        size_t have;     // Bytes stored in the buffer (already completed)
+        size_t pos;      // Offset already returned
+        bool pending;    // ReadFile outstanding
+        bool eof;        // EOF reached (0-byte completion)
         ov_read_t() : h(NULL), evt(NULL), have(0), pos(0), pending(false), eof(false) { ZeroMemory(&ov, sizeof(ov)); }
     } out_rd_, err_rd_;
 
     struct ov_write_t {
-        HANDLE h;        // 親の Write ハンドル
+        HANDLE h;        // Parent write handle
         OVERLAPPED ov;
-        HANDLE evt;      // 完了イベント
+        HANDLE evt;      // Completion event
         std::vector<char> buf;
-        size_t size;     // 投入サイズ
-        bool pending;    // WriteFile 投入中
-        DWORD last_n;    // 直近完了バイト
+        size_t size;     // Requested size
+        bool pending;    // WriteFile outstanding
+        DWORD last_n;    // Most recent completed byte count
         ov_write_t() : h(NULL), evt(NULL), size(0), pending(false), last_n(0) { ZeroMemory(&ov, sizeof(ov)); }
     } in_wr_;
 
@@ -467,9 +467,9 @@ private:
         return DuplicateHandle(proc, src, proc, dst, 0, TRUE, DUPLICATE_SAME_ACCESS);
     }
 
-    // -------- Named Pipe (Overlapped) 構築 --------
-    // parent_reads=true  : 親が READ（INBOUND）, 子が WRITE（GENERIC_WRITE）
-    // parent_reads=false : 親が WRITE（OUTBOUND）, 子が READ（GENERIC_READ）
+    // -------- Build overlapped Named Pipe --------
+    // parent_reads=true  : Parent reads (INBOUND), child writes (GENERIC_WRITE)
+    // parent_reads=false : Parent writes (OUTBOUND), child reads (GENERIC_READ)
     bool make_named_pipe_pair_(bool parent_reads, HANDLE* parent_end, HANDLE* child_end_inheritable, SECURITY_ATTRIBUTES* sa_child) {
         std::wstring name = unique_pipe_name_();
         DWORD open_mode = parent_reads ? (PIPE_ACCESS_INBOUND  | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE)
@@ -481,11 +481,11 @@ private:
             64*1024,      // out buf
             64*1024,      // in buf
             0,            // default timeout
-            NULL          // security attrs for server (非継承)
+            NULL          // Security attributes for the server (not inheritable)
         );
         if (hServer == INVALID_HANDLE_VALUE) return fail_api("CreateNamedPipeW"), false;
 
-        // Connect を Overlapped で開始（同一スレッドで CreateFile するため）
+        // Start ConnectNamedPipe with overlapped I/O so CreateFile can run on the same thread
         OVERLAPPED ov; ZeroMemory(&ov, sizeof(ov));
         HANDLE conn_evt = CreateEventW(NULL, TRUE, FALSE, NULL);
         if (!conn_evt) { CloseHandle(hServer); return fail_api("CreateEvent(connect)"); }
@@ -495,7 +495,7 @@ private:
         if (!c) {
             DWORD e = GetLastError();
             if (e == ERROR_PIPE_CONNECTED) {
-                // 既につながっているケース（まれ）
+                // Rare case where the pipe is already connected
                 SetEvent(conn_evt);
             } else if (e != ERROR_IO_PENDING) {
                 CloseHandle(conn_evt);
@@ -504,7 +504,7 @@ private:
             }
         }
 
-        // クライアント（子側）を親プロセスで開く（継承可能）
+        // Open the client (child) end in the parent as inheritable
         DWORD desired = parent_reads ? GENERIC_WRITE : GENERIC_READ;
         HANDLE hClient = CreateFileW(
             name.c_str(), desired, 0, sa_child,
@@ -516,7 +516,7 @@ private:
             return set_error("CreateFileW(pipe client)", e);
         }
 
-        // Connect 完了待ち（即完了のはずだが安全のため待つ）
+        // Wait for the connect to finish (should complete immediately, but wait to be safe)
         DWORD dummy=0;
         if (!GetOverlappedResult(hServer, &ov, &dummy, TRUE)) {
             DWORD e = GetLastError();
@@ -529,7 +529,7 @@ private:
         }
         CloseHandle(conn_evt);
 
-        // 親サーバハンドルは非継承化（保険）
+        // Mark the server handle as non-inheritable for safety
         SetHandleInformation(hServer, HANDLE_FLAG_INHERIT, 0);
 
         *parent_end = hServer;
@@ -555,7 +555,7 @@ private:
         return std::wstring(buf);
     }
 
-    // -------- Overlapped 読み取りユーティリティ --------
+    // -------- Overlapped read utilities --------
     static void init_ov_read(ov_read_t& r) { r = ov_read_t(); }
     static void init_ov_write(ov_write_t& w) { w = ov_write_t(); }
 
@@ -590,7 +590,7 @@ private:
         DWORD n = 0;
         BOOL ok = ReadFile(r.h, r.buf.empty()? NULL : &r.buf[0], (DWORD)r.buf.size(), &n, &r.ov);
         if (ok) {
-            // 即時完了
+            // Completed immediately
             r.have = n;
             r.pos  = 0;
             r.pending = false;
@@ -611,7 +611,7 @@ private:
         return fail_api("ReadFile(overlapped)");
     }
 
-    // イベントがシグナルなら結果を取得しキャッシュへ
+    // If the event is signaled, fetch the result and cache it
     bool acquire_completed_read_(ov_read_t& r) {
         if (!r.pending) return (r.have > r.pos) || r.eof;
         DWORD n = 0;
@@ -636,30 +636,30 @@ private:
         TINYPROC_UNUSED(tag);
         if (!r.h) return set_error("overlapped pipe invalid", ERROR_INVALID_HANDLE), (ssize_t)-1;
 
-        // 既にキャッシュがあればまず返却
+        // If data is already cached, return it first
         if (r.have > r.pos) {
             size_t avail = r.have - r.pos;
             size_t tocpy = (len < avail) ? len : avail;
             if (tocpy) std::memcpy(dst, &r.buf[r.pos], tocpy);
             r.pos += tocpy;
             if (r.pos == r.have) {
-                // 読み切ったので次の Read を投入
+                // Buffer consumed; queue the next Read
                 r.have = r.pos = 0;
                 if (!r.eof) post_read_(r);
-                else ResetEvent(r.evt); // EOF 到達後は消灯
+                else ResetEvent(r.evt); // Clear the event after reaching EOF
             }
             return (ssize_t)tocpy;
         }
 
         if (r.eof) return 0;
 
-        // 未完了なら完了確認
+        // If not complete, check for completion
         if (!acquire_completed_read_(r)) {
-            // まだ完了していない
+            // Still not complete
             return 0;
         }
 
-        // 完了済み（have/pos セット済み）
+        // Completion already cached (have/pos set)
         if (r.have > r.pos) {
             size_t avail = r.have - r.pos;
             size_t tocpy = (len < avail) ? len : avail;
@@ -673,13 +673,13 @@ private:
             return (ssize_t)tocpy;
         }
 
-        // 完了したが 0（EOF）
+        // Completed with 0 bytes (EOF)
         r.eof = true;
         ResetEvent(r.evt);
         return 0;
     }
 
-    // -------- 同期読み取り（PeekNamedPipe を使ったノンブロッキング風） --------
+    // -------- Synchronous read helper (non-blocking style via PeekNamedPipe) --------
     ssize_t read_sync_(HANDLE h, void* buf, size_t len, const char* tag) {
         if (!h) return set_error((std::string(tag) + " not available").c_str(), ERROR_INVALID_HANDLE), (ssize_t)-1;
         DWORD to_read = (DWORD)len;
@@ -689,7 +689,7 @@ private:
             if (!ok) {
                 DWORD e = GetLastError();
                 if (e == ERROR_BROKEN_PIPE) return 0;
-                // PeekNamedPipe は匿名パイプでも使用可能
+                // PeekNamedPipe is also available on anonymous pipes
                 return fail_api("PeekNamedPipe"), (ssize_t)-1;
             }
             if (avail == 0) return 0;
@@ -781,20 +781,20 @@ public:
         stream_spec out;  // child's stdout (1)
         stream_spec err;  // child's stderr (2)
 
-        // 親側(パイプ終端)を非ブロッキングにする
+        // Make the parent's pipe ends non-blocking
         bool parent_nonblock;
 
-        // 子プロセスのカレントディレクトリを変更（空文字なら変更なし）
+        // Change the child's current directory (no change if empty)
         std::string chdir_to;
 
-        // 子プロセスの環境変数の調整
-        // clear_env が true の場合、いったん環境を空にしてから env_kv を適用
+        // Adjust the child's environment variables
+        // If clear_env is true, clear the environment before applying env_kv
         bool clear_env;
-        std::vector<std::string> env_kv; // 各要素は "KEY=VALUE" 形式
+        std::vector<std::string> env_kv; // Each element is of the form "KEY=VALUE"
 
-        // setpgid を行う（プロセスグループ分離などに）
+        // Control setpgid (e.g., to detach process groups)
         bool setpgid;
-        pid_t pgid; // 0 なら自分をリーダに
+        pid_t pgid; // 0 means use the child as the group leader
 
         options()
         : parent_nonblock(false), clear_env(false),
@@ -809,19 +809,19 @@ public:
       last_errno_(0) {}
 
     ~popen3() {
-        // FD を閉じる
+        // Close file descriptors
         close_stdin();
         close_stdout();
         close_stderr();
-        // ゾンビ対策：非同期に waitpid(WNOHANG)
+        // Avoid zombies: call waitpid(WNOHANG) asynchronously
         if (pid_ > 0) {
             int status;
             ::waitpid(pid_, &status, WNOHANG);
         }
     }
 
-    // 起動：argv は ["prog", "arg1", ...]、空でないこと
-    // 戻り値：成功 true / 失敗 false（詳細は last_error() / last_errno()）
+    // Launch: argv must look like ["prog", "arg1", ...] and not be empty
+    // Returns true on success / false on failure (see last_error() / last_errno() for details)
     bool start(const std::vector<std::string>& argv, const options& opt = options()) {
         clear_last_error_();
 
@@ -830,7 +830,7 @@ public:
             return false;
         }
 
-        // ---- 準備：必要なパイプの作成 ----
+        // ---- Preparation: create the required pipes ----
         int in_pipe[2]  = { -1, -1 }; // parent writes -> child reads (stdin)
         int out_pipe[2] = { -1, -1 }; // child writes  -> parent reads (stdout)
         int err_pipe[2] = { -1, -1 }; // child writes  -> parent reads (stderr)
@@ -839,17 +839,17 @@ public:
         if (opt.out.mode == stream_spec::PIPE && ::pipe(out_pipe) != 0)  { safe_close_pair_(in_pipe);  return fail_perror_("pipe(stdout)"); }
         if (opt.err.mode == stream_spec::PIPE && ::pipe(err_pipe) != 0)  { safe_close_pair_(in_pipe); safe_close_pair_(out_pipe); return fail_perror_("pipe(stderr)"); }
 
-        // exec 失敗通知用パイプ（child->parent に errno を送る）
+        // Pipe used to report exec failures (child -> parent sends errno)
         int exerr[2] = { -1, -1 };
         if (::pipe(exerr) != 0) {
             safe_close_pair_(in_pipe); safe_close_pair_(out_pipe); safe_close_pair_(err_pipe);
             return fail_perror_("pipe(exec_err)");
         }
-        // 親子とも CLOEXEC 付与（成功した exec 後に自動的に閉じる）
+        // Add CLOEXEC on both sides so they close automatically after a successful exec
         set_cloexec_(exerr[0]);
         set_cloexec_(exerr[1]);
 
-        // 親側に残るパイプ終端は CLOEXEC を付与（FD リーク抑止）
+        // Also add CLOEXEC to the parent-resident ends to prevent FD leaks
         if (opt.in.mode  == stream_spec::PIPE) set_cloexec_(in_pipe[1]);
         if (opt.out.mode == stream_spec::PIPE) set_cloexec_(out_pipe[0]);
         if (opt.err.mode == stream_spec::PIPE) set_cloexec_(err_pipe[0]);
@@ -864,18 +864,18 @@ public:
 
         if (p == 0) {
             // -------- child --------
-            // exerr[0] は子では使わない
+            // The child does not use exerr[0]
             ::close(exerr[0]);
 
-            // 子側パイプ終端の CLOEXEC：exec 成功時に自動的に閉じる
+            // Apply CLOEXEC to the child pipe ends so they close automatically on successful exec
             if (opt.in.mode  == stream_spec::PIPE) set_cloexec_(in_pipe[0]);
             if (opt.out.mode == stream_spec::PIPE) set_cloexec_(out_pipe[1]);
             if (opt.err.mode == stream_spec::PIPE) set_cloexec_(err_pipe[1]);
 
-            // 標準入出力の付け替え
+            // Remap the standard streams
             if (!setup_child_stdio_(opt, in_pipe, out_pipe, err_pipe, exerr[1])) _exit(127);
 
-            // 環境変数の調整
+            // Adjust environment variables
             if (!apply_child_env_(opt, exerr[1])) _exit(127);
 
             // chdir
@@ -887,39 +887,39 @@ public:
 
             // setpgid
             if (opt.setpgid) {
-                pid_t target_pgid = opt.pgid ? opt.pgid : 0; // 0 は自分の PID
+                pid_t target_pgid = opt.pgid ? opt.pgid : 0; // 0 means use our own PID
                 if (::setpgid(0, target_pgid) != 0) {
                     write_errno_and_exit_(exerr[1], "setpgid");
                 }
             }
 
-            // argv 準備
+            // Prepare argv
             std::vector<char*> cargv;
             cargv.reserve(argv.size() + 1);
             for (size_t i = 0; i < argv.size(); ++i)
                 cargv.push_back(const_cast<char*>(argv[i].c_str()));
             cargv.push_back(0);
 
-            // execvp（PATH 解決）を利用
+            // Use execvp (performs PATH lookup)
             ::execvp(cargv[0], &cargv[0]);
 
-            // ここに来たら失敗
+            // Reaching this point means execvp failed
             write_errno_and_exit_(exerr[1], "execvp");
-            // _exit しているので到達しない
+            // Unreachable because _exit terminates
         }
 
         // -------- parent --------
         pid_ = p;
 
-        // exerr: 親は書き端を閉じてから errno 受信を試みる
+        // For exerr, close the write end before reading errno
         ::close(exerr[1]);
 
-        // 親子で不要なパイプ端を閉じる
+        // Close pipe ends that are no longer needed by either side
         if (opt.in.mode  == stream_spec::PIPE)  ::close(in_pipe[0]);   // child-read end
         if (opt.out.mode == stream_spec::PIPE)  ::close(out_pipe[1]);  // child-write end
         if (opt.err.mode == stream_spec::PIPE)  ::close(err_pipe[1]);  // child-write end
 
-        // 親側保持 FD を保存
+        // Save the parent-owned FDs
         in_w_  = (opt.in.mode  == stream_spec::PIPE) ? in_pipe[1]  : -1;
         out_r_ = (opt.out.mode == stream_spec::PIPE) ? out_pipe[0] : -1;
         err_r_ = (opt.err.mode == stream_spec::PIPE) ? err_pipe[0] : -1;
@@ -933,32 +933,32 @@ public:
             if (err_r_ != -1) set_nonblock_(err_r_, true);
         }
 
-        // exec 成否を確認：子が exerr に errno(int) を書く
+        // Check whether exec succeeded: the child writes errno(int) to exerr on failure
         int child_exec_errno = 0;
         ssize_t n = read_full_errno_(exerr[0], &child_exec_errno, sizeof(child_exec_errno));
         ::close(exerr[0]);
 
         if (n > 0) {
-            // exec 構築中に失敗
+            // Exec setup failed
             int st;
-            ::waitpid(pid_, &st, 0); // 確実に回収
+            ::waitpid(pid_, &st, 0); // Ensure the child is reaped
             cleanup_parent_fds_();
             char buf[128]; std::snprintf(buf, sizeof(buf), "exec failed (errno=%d)", child_exec_errno);
             set_last_error_(buf, child_exec_errno);
             pid_ = -1;
             return false;
         }
-        // n == 0 の場合は EOF（= exec 成功で CLOEXEC により閉じられた）
+        // n == 0 means EOF (successful exec closed the pipe via CLOEXEC)
         return true;
     }
 
-    // 書き込み（子の stdin へ）。EINTR は内部でリトライし、他はそのまま返す。
+    // Write to the child's stdin. EINTR is retried internally; other errors propagate.
     ssize_t write_stdin(const void* data, size_t len) {
         if (in_w_ == -1) { set_last_error_("stdin is not a pipe", EBADF); return -1; }
         return retry_eintr_write_(in_w_, data, len);
     }
 
-    // 読み込み（子の stdout / stderr から）
+    // Read from the child's stdout / stderr
     ssize_t read_stdout(void* buf, size_t len) {
         if (out_r_ == -1) { set_last_error_("stdout is not a pipe", EBADF); return -1; }
         return retry_eintr_read_(out_r_, buf, len);
@@ -968,15 +968,15 @@ public:
         return retry_eintr_read_(err_r_, buf, len);
     }
 
-    // 親側パイプ終端を明示的に閉じる（EPIPE を発生させたい場合など）
+    // Explicitly close the parent's pipe ends (useful if you want to trigger EPIPE)
     void close_stdin()  { safe_close_(in_w_,  own_in_w_);  own_in_w_  = false; in_w_  = -1; }
     void close_stdout() { safe_close_(out_r_, own_out_r_); own_out_r_ = false; out_r_ = -1; }
     void close_stderr() { safe_close_(err_r_, own_err_r_); own_err_r_ = false; err_r_ = -1; }
 
-    // 子プロセス制御
+    // Child process control
     pid_t pid() const { return pid_; }
 
-    // 子が生存しているか（非ブロッキング）
+    // Check if the child is alive (non-blocking)
     bool alive() const {
         if (pid_ <= 0) return false;
         int st;
@@ -984,7 +984,7 @@ public:
         return (r == 0);
     }
 
-    // wait：options は 0 または WNOHANG 等
+    // wait: options can be 0, WNOHANG, etc.
     int wait(int* status, int options) {
         if (pid_ <= 0) { set_last_error_("no child", ECHILD); return -1; }
         int st;
@@ -997,14 +997,14 @@ public:
             pid_ = -1;
             cleanup_parent_fds_();
         } else if (r == 0) {
-            // まだ終了していない
+            // Not finished yet
         } else {
             set_last_error_("waitpid", errno);
         }
         return r;
     }
 
-    // kill(シグナル送信)
+    // kill (send a signal)
     int kill(int sig) {
         if (pid_ <= 0) { set_last_error_("no child", ECHILD); return -1; }
         int r = ::kill(pid_, sig);
@@ -1012,12 +1012,12 @@ public:
         return r;
     }
 
-    // FD 取得（-1 の場合あり）
-    int stdin_fd()  const { return in_w_;  } // 親が書く
-    int stdout_fd() const { return out_r_; } // 親が読む
-    int stderr_fd() const { return err_r_; } // 親が読む
+    // Retrieve FDs (may be -1)
+    int stdin_fd()  const { return in_w_;  } // Written by the parent
+    int stdout_fd() const { return out_r_; } // Read by the parent
+    int stderr_fd() const { return err_r_; } // Read by the parent
 
-    // 直近のエラー
+    // Most recent error
     const std::string& last_error() const { return last_error_msg_; }
     int last_errno() const { return last_errno_; }
 
@@ -1028,18 +1028,18 @@ private:
     std::string last_error_msg_;
     int last_errno_;
 
-    // ---- child 構築補助 ----
+    // ---- Child setup helpers ----
     bool setup_child_stdio_(const options& opt, int in_pipe[2], int out_pipe[2], int err_pipe[2], int exerr_w) {
         // stdin
         if (opt.in.mode == stream_spec::PIPE) {
-            ::close(in_pipe[1]); // 親書き端は閉じる
+            ::close(in_pipe[1]); // Close the parent's write end
             if (::dup2(in_pipe[0], 0) == -1) { write_errno_and_exit_(exerr_w, "dup2(stdin)"); }
             if (in_pipe[0] != 0) ::close(in_pipe[0]);
         } else if (opt.in.mode == stream_spec::USE_FD) {
             if (opt.in.fd != 0) {
                 if (::dup2(opt.in.fd, 0) == -1) { write_errno_and_exit_(exerr_w, "dup2(stdin FD)"); }
             }
-            // 子では元 FD を閉じてリーク抑止（親側には影響なし）
+            // Close the original FD in the child to avoid leaks (does not affect the parent)
             if (opt.in.fd > 2) ::close(opt.in.fd);
         }
         // stdout
@@ -1070,12 +1070,12 @@ private:
     bool apply_child_env_(const options& opt, int exerr_w) {
         if (opt.clear_env) {
 #if defined(__GLIBC__)
-            // clearenv は glibc で使用可能
+            // clearenv is available with glibc
             if (::clearenv() != 0) {
                 write_errno_and_exit_(exerr_w, "clearenv");
             }
 #else
-            // 非 glibc の場合は何もしない（互換性優先）
+            // Do nothing on non-glibc systems (for compatibility)
 #endif
         }
         for (size_t i = 0; i < opt.env_kv.size(); ++i) {
@@ -1148,7 +1148,7 @@ private:
             ssize_t n = ::write(fd, p, left);
             if (n < 0) {
                 if (errno == EINTR) continue;
-                return n; // エラー
+                return n; // Error
             }
             left -= (size_t)n;
             p += n;
@@ -1156,8 +1156,8 @@ private:
         return (ssize_t)len;
     }
     static ssize_t read_full_errno_(int fd, void* buf, size_t len) {
-        // exec 成功時は CLOEXEC により EOF(0) を即座に受ける想定。
-        // 失敗時は errno(int) が書かれる。
+        // On successful exec, CLOEXEC should cause an immediate EOF (0).
+        // On failure, errno (as int) is written.
         char* p = static_cast<char*>(buf);
         size_t got = 0;
         while (got < len) {
@@ -1172,9 +1172,9 @@ private:
         return (ssize_t)got;
     }
     static void write_errno_and_exit_(int fd, const char* where) {
-        (void)where; // where はデバッグ用途（必要なら書き込む）
+        (void)where; // where is available for debugging if needed
         int e = errno;
-        // best-effort: errno を親へ
+        // Best effort: write errno back to the parent
         (void)::write(fd, &e, sizeof(e));
         _exit(127);
     }

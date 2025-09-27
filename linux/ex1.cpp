@@ -6,7 +6,7 @@
 int main() {
     using namespace tinyproc;
 
-    popen3::options opt; // デフォルトはすべて INHERIT
+    popen3::options opt; // Defaults to INHERIT for every stream
     popen3 proc;
 
     std::vector<std::string> argv;

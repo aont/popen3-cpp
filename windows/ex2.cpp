@@ -12,7 +12,7 @@ int main() {
     opt.in  = popen3::stream_spec::pipe();
     opt.out = popen3::stream_spec::pipe();
     opt.err = popen3::stream_spec::pipe();
-    opt.parent_nonblock = true; // データが無い場合は read_* が 0 を返す
+    opt.parent_nonblock = true; // read_* returns 0 when no data is available
 
     popen3 proc;
     std::vector<std::string> argv;
@@ -26,13 +26,13 @@ int main() {
         return 1;
     }
 
-    // 親 -> 子 stdin
+    // Parent -> child stdin
     const char* line = "hello\r\n";
     proc.write_stdin(line, std::strlen(line));
-    // EOF 通知
+    // Notify EOF
     proc.close_stdin();
 
-    // 同時読み取り（ポーリング）
+    // Poll both streams simultaneously
     char buf[4096];
     for (;;) {
         ssize_t n1 = proc.read_stdout(buf, sizeof(buf));
@@ -42,7 +42,7 @@ int main() {
         if (n2 > 0) std::fwrite(buf, 1, (size_t)n2, stderr);
 
         if (!proc.alive()) {
-            // 残りを吸いきる
+            // Drain any remaining data
             for (;;) {
                 ssize_t m1 = proc.read_stdout(buf, sizeof(buf));
                 ssize_t m2 = proc.read_stderr(buf, sizeof(buf));
@@ -53,7 +53,7 @@ int main() {
             break;
         }
 
-        // CPU を荒らさないよう少し待つ
+        // Sleep a little to avoid busy-looping
         Sleep(10);
     }
 

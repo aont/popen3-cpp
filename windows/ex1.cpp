@@ -6,11 +6,11 @@
 int main() {
     using namespace tinyproc;
 
-    popen3::options opt; // 既定はすべて INHERIT
+    popen3::options opt; // Defaults to INHERIT for every stream
     popen3 proc;
 
     std::vector<std::string> argv;
-    // Unix の "ls -la" 相当
+    // Equivalent to the Unix "ls -la"
     argv.push_back("cmd");
     argv.push_back("/c");
     argv.push_back("dir");
@@ -21,6 +21,6 @@ int main() {
         return 1;
     }
     int st = 0;
-    proc.wait(&st, 0); // 無限待ち
+    proc.wait(&st, 0); // Wait indefinitely
     return (st == 0) ? 0 : 1;
 }
